@@ -1,0 +1,2 @@
+# daneel
+Agentic development orchestrator
