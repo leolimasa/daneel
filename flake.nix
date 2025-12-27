@@ -16,11 +16,13 @@
         pythonEnv = python.withPackages (ps: with ps; [
           # Core dependencies
           pyyaml
+          pexpect
           # Testing
           pytest
           pytest-cov
           # Type checking
           mypy
+          types-pyyaml
           # Linting
           ruff
         ]);

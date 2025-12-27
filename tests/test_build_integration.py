@@ -51,13 +51,10 @@ sys.path.insert(0, "{lib_path}")
 import daneel
 
 # Test that all functions are available
-from daneel import Output, claude_code, validate, update_yml, checkbox_progress
+from daneel import Action, start, send_input, wait_for_output, load_actions, main
 
-# Test Output creation
-output = Output("test", "")
-assert output.stdout == "test"
-
-print("All imports and basic functionality working")
+# Test basic functionality
+print("All imports working")
 '''
     
     try:
@@ -68,7 +65,7 @@ print("All imports and basic functionality working")
             timeout=30
         )
         assert result.returncode == 0, f"Import test failed: {result.stderr}"
-        assert "All imports and basic functionality working" in result.stdout
+        assert "All imports working" in result.stdout
         
     except subprocess.TimeoutExpired:
         pytest.fail("Import test timed out")

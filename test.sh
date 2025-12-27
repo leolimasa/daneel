@@ -18,6 +18,13 @@ export PYTHONPATH=.
 
 echo "Python version: $(python --version)"
 echo "pytest version: $(pytest --version)"
+echo "mypy version: $(mypy --version)"
+echo ""
+
+# Run type checking
+echo "Running type checking..."
+mypy daneel.py
+echo "✅ Type checking passed!"
 echo ""
 
 # Run all tests with verbose output

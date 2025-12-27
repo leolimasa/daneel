@@ -15,6 +15,7 @@ def test_required_modules_available():
     try:
         import yaml
         import pytest
+        import pexpect
     except ImportError as e:
         pytest.fail(f"Required module not available: {e}")
 

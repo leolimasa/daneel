@@ -1,208 +1,294 @@
-"""Daneel - Python helper functions for agentic coding assistants."""
+"""Daneel - Python helper functions for agentic coding assistants using pexpect."""
 
 import importlib.util
-import json
-import re
+import inspect
+import io
+import os
+import pexpect  # type: ignore[import-untyped]
 import select
+import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, List
-
-import yaml  # type: ignore[import-untyped]
+from typing import List, Optional, Any
 
 
-@dataclass
-class Output:
-    """Dataclass representing the output of a command 
+class Action(ABC):
+    """Base class for command line actions that can be performed on spawned processes."""
     
-    Attributes:
-        stdout: Standard output from command execution
-        stderr: Standard error from command execution 
-    """
-    stdout: str
-    stderr: str
+    @abstractmethod
+    def execute(self, spawn: pexpect.spawn) -> None:
+        """Execute the action on the spawned process.
+        
+        Args:
+            spawn: The pexpect spawned process to operate on
+        """
+        pass
+    
+    @abstractmethod
+    def get_name(self) -> str:
+        """Return the name of this action.
+        
+        Returns:
+            String name identifying this action
+        """
+        pass
 
-    def __post_init__(self) -> None:
-        """Validate that stdout and stderr are strings."""
-        if not isinstance(self.stdout, str):
-            raise TypeError("stdout must be a string")
-        if not isinstance(self.stderr, str):
-            raise TypeError("stderr must be a string")
 
-
-def validate(
-    cmd: str,
-    fail_fn: Callable[[Output], Output],
-    timeout: int = 120,
-    retries: int = 3,
-    cwd: Optional[str] = None
-) -> Output:
-    """Execute a command and call fail_fn if it fails, then retry.
+def start(command: List[str], actions: List[Action], actions_shortcut: str) -> pexpect.spawn:
+    """Start a command line program using pexpect and return the spawned process.
+    
+    The output is displayed in real-time so the user can see what is happening 
+    and interact if necessary. When the specified shortcut is pressed, a list 
+    of actions is displayed for user selection.
     
     Args:
-        cmd: Command to execute
-        fail_fn: Function to call on failure, takes Output and returns Output
-        timeout: Maximum execution time in seconds
-        retries: Number of retry attempts on failure
-        cwd: Working directory for command execution (uses find_git_root if None)
+        command: List of command arguments to spawn
+        actions: List of Action objects available for execution
+        actions_shortcut: Keyboard shortcut that triggers action menu
         
     Returns:
-        Output object with final command results
+        The spawned pexpect process
         
     Raises:
-        Exception: If all retries fail or command times out
+        Exception: If the command cannot be started
     """
-    working_dir = cwd or find_git_root()
-    
-    for attempt in range(retries + 1):
+    try:
+        # Join command list into a single string for pexpect
+        cmd_str = ' '.join(command)
+        spawn = pexpect.spawn(cmd_str)
+        
+        # Set window size to match current terminal
         try:
-            result = subprocess.run(
-                cmd,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                cwd=working_dir
-            )
+            import shutil
+            cols, rows = shutil.get_terminal_size()
+            spawn.setwinsize(rows, cols)
+        except:
+            spawn.setwinsize(24, 80)  # Fallback size
+        
+        # Custom interact function with action shortcut support
+        if actions and actions_shortcut:
+            _interact_with_actions(spawn, actions, actions_shortcut)
+        else:
+            # Standard pexpect interact without action support
+            spawn.interact()
+        
+        return spawn
+        
+    except Exception as e:
+        raise Exception(f"Failed to start command {command}: {e}")
+
+
+def _interact_with_actions(spawn: pexpect.spawn, actions: List[Action], shortcut: str) -> None:
+    """Custom interact function that handles user input and action shortcuts.
+    
+    Args:
+        spawn: The pexpect spawned process
+        actions: List of available actions  
+        shortcut: Keyboard shortcut that triggers action menu
+    """
+    import termios
+    import tty
+    
+    try:
+        # Check if we have a real terminal (not during testing)
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        has_terminal = True
+    except (OSError, io.UnsupportedOperation):
+        # No real terminal available (e.g., during testing)
+        # Fall back to standard interact
+        spawn.interact()
+        return
+    
+    try:
+        # Set terminal to raw mode for character-by-character input
+        tty.setraw(fd)
+        
+        while spawn.isalive():
+            # Use select to check for input from user or output from spawn
+            ready, _, _ = select.select([sys.stdin, spawn], [], [], 0.1)
             
-            output = Output(
-                stdout=result.stdout,
-                stderr=result.stderr
-            )
-            
-            if result.returncode == 0:
-                return output
-            
-            if attempt < retries:
-                # Call failure function and retry
-                fail_fn(output)  # Call failure function to potentially fix the issue
-                time.sleep(2 ** attempt)
+            if sys.stdin in ready:
+                # Read one character from user
+                try:
+                    char = sys.stdin.read(1)
+                    if char == shortcut:
+                        # Restore terminal temporarily for action menu
+                        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                        try:
+                            print("\n")  # Add newline before menu
+                            show_action_menu(spawn, actions)
+                        finally:
+                            # Return to raw mode
+                            tty.setraw(fd)
+                    elif char == '\x03':  # Ctrl+C
+                        # Send interrupt to spawned process
+                        spawn.sendintr()
+                    elif char == '\x04':  # Ctrl+D (EOF)
+                        spawn.sendeof()
+                    elif char == '\x1a':  # Ctrl+Z
+                        # Send suspend signal
+                        spawn.kill(signal.SIGTSTP)
+                    else:
+                        # Forward character to spawned process
+                        spawn.send(char)
+                except (KeyboardInterrupt, EOFError):
+                    break
+                    
+            if spawn in ready:
+                # Read output from spawned process and display it
+                try:
+                    output = spawn.read_nonblocking(size=1000, timeout=0)
+                    if output:
+                        sys.stdout.write(output.decode('utf-8', errors='replace'))
+                        sys.stdout.flush()
+                except pexpect.TIMEOUT:
+                    continue
+                except pexpect.EOF:
+                    break
+                    
+    finally:
+        # Restore original terminal settings if we have them
+        if has_terminal:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def send_input(process: pexpect.spawn, input_str: str) -> None:
+    """Send the specified input string to the spawned process.
+    
+    Args:
+        process: The pexpect spawned process
+        input_str: The string to send to the process
+        
+    Raises:
+        Exception: If sending input fails
+    """
+    try:
+        process.send(input_str)
+    except Exception as e:
+        raise Exception(f"Failed to send input '{input_str}': {e}")
+
+
+def wait_for_output(process: pexpect.spawn, expected_output: str, timeout: int = 30) -> bool:
+    """Wait for the specified expected output from the spawned process.
+    
+    Args:
+        process: The pexpect spawned process
+        expected_output: The output string to wait for
+        timeout: Maximum time to wait in seconds
+        
+    Returns:
+        True if the expected output is found, False otherwise
+    """
+    try:
+        index = process.expect([expected_output, pexpect.TIMEOUT], timeout=timeout)
+        return bool(index == 0)
+    except Exception:
+        return False
+
+
+def load_actions(folder: str) -> List[Action]:
+    """Load action classes from Python files in the specified folder.
+    
+    Finds action Python files in the specified folder, loads them dynamically,
+    instantiates all classes that inherit from Action, and returns a list of 
+    those objects.
+    
+    Args:
+        folder: Path to the folder containing action Python files
+        
+    Returns:
+        List of instantiated Action objects
+        
+    Raises:
+        Exception: If folder doesn't exist or action loading fails
+    """
+    folder_path = Path(folder)
+    if not folder_path.exists():
+        raise Exception(f"Actions folder not found: {folder}")
+    
+    actions = []
+    
+    try:
+        # Find all Python files in the folder
+        for py_file in folder_path.glob("*.py"):
+            if py_file.name.startswith("__"):
+                continue  # Skip __init__.py and similar files
+                
+            # Load the module dynamically
+            module_name = f"action_{py_file.stem}"
+            spec = importlib.util.spec_from_file_location(module_name, py_file)
+            if spec is None or spec.loader is None:
                 continue
                 
-        except subprocess.TimeoutExpired:
-            if attempt < retries:
-                time.sleep(2 ** attempt)
-                continue
-            raise Exception(f"Command timed out after {timeout} seconds")
-    
-    raise Exception(f"Command failed after {retries + 1} attempts")
-
-
-def update_yml(file: str, field: str, value: Any) -> None:
-    """Update a field in a YAML file using query-based field selection.
-    
-    Args:
-        file: Path to the YAML file
-        field: Query string for the field to update (e.g., 'key.subkey[0].field')
-        value: New value to set
-        
-    Raises:
-        FileNotFoundError: If the YAML file doesn't exist
-        yaml.YAMLError: If the YAML file is malformed
-        ValueError: If the field query is invalid
-    """
-    file_path = Path(file)
-    
-    if not file_path.exists():
-        raise FileNotFoundError(f"YAML file not found: {file}")
-    
-    try:
-        with open(file_path, 'r') as f:
-            data = yaml.safe_load(f) or {}
-    except yaml.YAMLError as e:
-        raise yaml.YAMLError(f"Failed to parse YAML file: {e}")
-    
-    # Parse field query and update nested structure
-    keys = field.split('.')
-    current = data
-    
-    try:
-        # Navigate to the parent of the target field
-        for key in keys[:-1]:
-            if '[' in key and ']' in key:
-                # Handle array indexing like 'items[0]'
-                base_key, index_str = key.split('[', 1)
-                index = int(index_str.rstrip(']'))
-                if base_key not in current:
-                    current[base_key] = []
-                while len(current[base_key]) <= index:
-                    current[base_key].append({})
-                current = current[base_key][index]
-            else:
-                if key not in current:
-                    current[key] = {}
-                current = current[key]
-        
-        # Set the final value
-        final_key = keys[-1]
-        if '[' in final_key and ']' in final_key:
-            base_key, index_str = final_key.split('[', 1)
-            index = int(index_str.rstrip(']'))
-            if base_key not in current:
-                current[base_key] = []
-            while len(current[base_key]) <= index:
-                current[base_key].append(None)
-            current[base_key][index] = value
-        else:
-            current[final_key] = value
+            module = importlib.util.module_from_spec(spec)
+            # Add the current directory to sys.path temporarily for imports
+            current_dir = str(Path.cwd())
+            if current_dir not in sys.path:
+                sys.path.insert(0, current_dir)
+            try:
+                spec.loader.exec_module(module)
+            finally:
+                # Remove the added path
+                if current_dir in sys.path:
+                    sys.path.remove(current_dir)
             
-    except (KeyError, ValueError, IndexError) as e:
-        raise ValueError(f"Invalid field query '{field}': {e}")
+            # Find all classes that inherit from Action
+            for name, obj in inspect.getmembers(module, inspect.isclass):
+                # Check if it's a class that has the required methods (duck typing approach)
+                if (hasattr(obj, 'execute') and hasattr(obj, 'get_name') and 
+                    callable(getattr(obj, 'execute')) and callable(getattr(obj, 'get_name')) and
+                    name not in ['Action', 'ActionBase']):  # Skip base classes
+                    # Instantiate the action class
+                    try:
+                        action_instance = obj()
+                        actions.append(action_instance)
+                    except Exception as e:
+                        print(f"Warning: Could not instantiate action {name}: {e}")
+                        
+    except Exception as e:
+        raise Exception(f"Failed to load actions from {folder}: {e}")
     
-    try:
-        with open(file_path, 'w') as f:
-            yaml.safe_dump(data, f, default_flow_style=False)
-    except yaml.YAMLError as e:
-        raise yaml.YAMLError(f"Failed to write YAML file: {e}")
+    return actions
 
 
-def checkbox_progress(file: str) -> float:
-    """Calculate the percentage of completed checkboxes in a markdown file.
+def show_action_menu(spawn: pexpect.spawn, actions: List[Action]) -> None:
+    """Display action menu and execute selected action.
     
     Args:
-        file: Path to the markdown file
-        
-    Returns:
-        Float between 0.0 and 1.0 representing completion percentage
-        
-    Raises:
-        FileNotFoundError: If the markdown file doesn't exist
+        spawn: The pexpect spawned process
+        actions: List of available actions
     """
-    file_path = Path(file)
+    if not actions:
+        print("\nNo actions available.")
+        return
     
-    if not file_path.exists():
-        raise FileNotFoundError(f"Markdown file not found: {file}")
+    print(f"\nAvailable actions:")
+    for i, action in enumerate(actions, 1):
+        print(f"{i}. {action.get_name()}")
     
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-    except Exception as e:
-        raise Exception(f"Failed to read markdown file: {e}")
-    
-    # Find all checkbox patterns: - [ ] and - [x] (with various spacing)
-    # REVIEW: checkbox patterns should also include * [ ] and * [x] and be case insensitive
-    checkbox_pattern = r'^\s*[-*]\s*\[([x\s])\]'
-    matches = re.findall(checkbox_pattern, content, re.MULTILINE | re.IGNORECASE)
-    
-    if not matches:
-        return 0.0
-    
-    completed = sum(1 for match in matches if match.lower().strip() == 'x')
-    total = len(matches)
-    
-    return completed / total
+        selection = input("\nSelect an action (number): ")
+        index = int(selection) - 1
+        
+        if 0 <= index < len(actions):
+            actions[index].execute(spawn)
+        else:
+            print("Invalid selection.")
+            
+    except (ValueError, KeyboardInterrupt):
+        print("\nAction cancelled.")
 
-def find_git_root() -> str:
+
+def find_git_root() -> Optional[str]:
     """Find the root directory of the current git repository.
     
     Returns:
-        The absolute path to the root directory of the git repository.
-        
-    Raises:
-        Exception: If the current directory is not inside a git repository.
+        The absolute path to the root directory of the git repository,
+        or None if not in a git repository.
     """
     try:
         result = subprocess.run(
@@ -213,25 +299,70 @@ def find_git_root() -> str:
         )
         return result.stdout.strip()
     except subprocess.CalledProcessError:
-        raise Exception("Not inside a git repository")
+        return None
 
-def changed_git_files() -> List[str]:
-    """Get a list of files changed in the current git repository.
+
+def main() -> None:
+    """Main entry point for the daneel CLI.
     
-    Returns:
-        A list of file paths that have been changed.
+    Loads actions and starts a command line program using command line arguments.
+    Actions are loaded from:
+    1. "actions" subdirectory of current directory
+    2. "daneel" directory in git root (if in a git repository)
+    3. Directory specified by DANEEL_ACTIONS environment variable (if set)
     """
+    if len(sys.argv) < 2:
+        print("Usage: python daneel.py <command> [args...]")
+        print("       python -m daneel <command> [args...]")
+        return
+    
+    # Get command from command line arguments
+    command = sys.argv[1:]
+    
+    # Load actions from various sources
+    actions = []
+    action_sources = []
+    
+    # Check local actions directory
+    if os.path.exists("actions"):
+        action_sources.append("actions")
+    
+    # Check daneel directory in git root
+    git_root = find_git_root()
+    if git_root:
+        daneel_dir = Path(git_root) / "daneel"
+        if daneel_dir.exists():
+            action_sources.append(str(daneel_dir))
+    
+    # Check environment variable
+    env_actions = os.getenv("DANEEL_ACTIONS")
+    if env_actions and os.path.exists(env_actions):
+        action_sources.append(env_actions)
+    
+    # Load actions from all sources
+    for source in action_sources:
+        try:
+            actions.extend(load_actions(source))
+        except Exception as e:
+            print(f"Warning: Failed to load actions from {source}: {e}")
+    
+    # Default shortcut key (Ctrl+A might be more practical than a single char)
+    actions_shortcut = "\x01"  # Ctrl+A
+    
     try:
-        result = subprocess.run(
-            ["git", "diff", "--name-only"],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        files = result.stdout.strip().splitlines()
-        return [file for file in files if file]
-    except subprocess.CalledProcessError:
-        raise Exception("Failed to get changed git files") 
+        # Start the command with loaded actions
+        spawn = start(command, actions, actions_shortcut)
+        
+        # Keep the process running until it exits
+        spawn.expect(pexpect.EOF)
+        
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}")
+        sys.exit(1)
 
 
-
+if __name__ == "__main__":
+    main()
