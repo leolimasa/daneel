@@ -1,6 +1,8 @@
 """Integration tests for the complete daneel workflow."""
 
 import json
+import subprocess
+import sys
 import tempfile
 import unittest.mock
 from pathlib import Path
@@ -76,9 +78,11 @@ class TestIntegration:
             Path(yaml_path).unlink()
             Path(md_path).unlink()
 
+    @unittest.mock.patch('daneel.find_git_root')
     @unittest.mock.patch('daneel.subprocess.run')
-    def test_command_validation_with_retry(self, mock_run):
+    def test_command_validation_with_retry(self, mock_run, mock_find_git_root):
         """Test the validate function with failure and recovery."""
+        mock_find_git_root.return_value = "/test/repo"
         # Simulate a command that fails then succeeds
         mock_run.side_effect = [
             unittest.mock.Mock(returncode=1, stdout="", stderr="build failed"),
@@ -100,8 +104,11 @@ class TestIntegration:
         assert fix_attempts == 1
         assert mock_run.call_count == 2
 
-    @unittest.mock.patch('daneel.subprocess.run')
-    def test_claude_code_with_structured_workflow(self, mock_run):
+    @unittest.mock.patch('daneel.subprocess.Popen')
+    @unittest.mock.patch('daneel.select.select')
+    @unittest.mock.patch('sys.stdout')
+    @unittest.mock.patch('sys.stderr')
+    def test_claude_code_with_structured_workflow(self, mock_stderr, mock_stdout, mock_select, mock_popen):
         """Test claude_code function with structured output in a workflow context."""
         # Mock claude returning structured data for a task analysis
         task_analysis = {
@@ -113,11 +120,23 @@ class TestIntegration:
             "estimated_hours": 8
         }
         
-        mock_run.return_value = unittest.mock.Mock(
-            returncode=0,
-            stdout=json.dumps(task_analysis),
-            stderr=""
-        )
+        json_output = json.dumps(task_analysis)
+        
+        # Mock the process
+        mock_process = unittest.mock.Mock()
+        mock_process.poll.side_effect = [None, 0]  # Running, then finished
+        mock_process.returncode = 0
+        mock_process.stdout.readline.side_effect = [json_output, ""]
+        mock_process.stderr.readline.side_effect = ["", ""]
+        mock_process.stdout.read.return_value = ""
+        mock_process.stderr.read.return_value = ""
+        mock_process.wait.return_value = None
+        mock_popen.return_value = mock_process
+        
+        mock_select.side_effect = [
+            ([mock_process.stdout], [], []),
+            ([], [], [])
+        ]
         
         # Request task analysis from Claude
         result = claude_code("Analyze this project and break it down into tasks", structured=True)
@@ -127,9 +146,10 @@ class TestIntegration:
         assert len(result.structured["tasks"]) == 3
         assert result.structured["estimated_hours"] == 8
         
-        # Verify the prompt was modified to request JSON
-        args = mock_run.call_args[0][0]
-        assert "Please respond with valid JSON only." in args[1]
+        # Verify the --output-format json flag was used
+        args = mock_popen.call_args[0][0]
+        assert "--output-format" in args
+        assert "json" in args
 
     def test_complex_yaml_updates(self):
         """Test complex nested YAML updates."""
@@ -219,25 +239,42 @@ echo "- [ ] not a real checkbox"
         finally:
             Path(temp_path).unlink()
 
-    @unittest.mock.patch('daneel.subprocess.run')
-    def test_timeout_and_retry_mechanisms(self, mock_run):
+    @unittest.mock.patch('daneel.find_git_root')
+    @unittest.mock.patch('daneel.subprocess.Popen')
+    @unittest.mock.patch('daneel.select.select')
+    @unittest.mock.patch('sys.stdout')
+    @unittest.mock.patch('sys.stderr')
+    def test_timeout_and_retry_mechanisms(self, mock_stderr_stream, mock_stdout_stream, mock_select, mock_popen, mock_find_git_root):
         """Test timeout and retry mechanisms work across all functions."""
         import subprocess
         
-        # Test claude_code timeout
-        mock_run.side_effect = subprocess.TimeoutExpired("claude", 120)
+        mock_find_git_root.return_value = "/test/repo"
         
-        with pytest.raises(Exception, match="Command timed out"):
+        # Test claude_code timeout
+        mock_process = unittest.mock.Mock()
+        mock_process.poll.return_value = None  # Never finishes
+        mock_process.stdout.readline.return_value = ""
+        mock_process.stderr.readline.return_value = ""
+        mock_process.stdout.read.return_value = ""
+        mock_process.stderr.read.return_value = ""
+        mock_process.wait.side_effect = subprocess.TimeoutExpired("claude", 1)
+        mock_process.kill.return_value = None
+        mock_popen.return_value = mock_process
+        
+        mock_select.return_value = ([], [], [])  # No data ready
+        
+        with pytest.raises(Exception, match="timed out after 1 seconds"):
             claude_code("test prompt", timeout=1, retries=0)
         
-        # Test validate timeout
-        mock_run.side_effect = subprocess.TimeoutExpired("test", 120)
-        
-        def dummy_fail_fn(output):
-            return Output("fix attempt", "")
-        
-        with pytest.raises(Exception, match="Command timed out"):
-            validate("test command", dummy_fail_fn, timeout=1, retries=0)
+        # Test validate timeout (validate still uses subprocess.run)
+        with unittest.mock.patch('daneel.subprocess.run') as mock_run_validate:
+            mock_run_validate.side_effect = subprocess.TimeoutExpired("test", 1)
+            
+            def dummy_fail_fn(output):
+                return Output("fix attempt", "")
+            
+            with pytest.raises(Exception, match="timed out after 1 seconds"):
+                validate("test command", dummy_fail_fn, timeout=1, retries=0)
 
     def test_error_handling_and_edge_cases(self):
         """Test error handling across all functions."""

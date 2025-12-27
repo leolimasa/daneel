@@ -1,6 +1,7 @@
 """Tests for the daneel module."""
 
 import json
+import subprocess
 import tempfile
 import unittest.mock
 from pathlib import Path
@@ -8,7 +9,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from daneel import Output, checkbox_progress, claude_code, update_yml, validate
+from daneel import Output, checkbox_progress, claude_code, update_yml, validate, main
 
 
 class TestOutput:
@@ -46,94 +47,244 @@ class TestOutput:
 class TestClaudeCode:
     """Tests for the claude_code function."""
 
-    @unittest.mock.patch('daneel.subprocess.run')
-    def test_claude_code_success(self, mock_run):
+    @unittest.mock.patch('daneel.find_git_root')
+    @unittest.mock.patch('daneel.subprocess.Popen')
+    @unittest.mock.patch('daneel.select.select')
+    @unittest.mock.patch('sys.stdout')
+    @unittest.mock.patch('sys.stderr')
+    def test_claude_code_success(self, mock_stderr, mock_stdout, mock_select, mock_popen, mock_find_git_root):
         """Test successful claude_code execution."""
-        mock_run.return_value = unittest.mock.Mock(
-            returncode=0,
-            stdout="Hello world",
-            stderr=""
-        )
+        mock_find_git_root.return_value = "/test/repo"
+        
+        # Mock the process
+        mock_process = unittest.mock.Mock()
+        mock_process.poll.side_effect = [None, None, 0]  # Running, then finished
+        mock_process.returncode = 0
+        mock_process.stdout.readline.side_effect = ["Hello world\n", ""]
+        mock_process.stderr.readline.side_effect = ["", ""]
+        mock_process.stdout.read.return_value = ""
+        mock_process.stderr.read.return_value = ""
+        mock_process.wait.return_value = None
+        mock_popen.return_value = mock_process
+        
+        # Mock select to return stdout ready once, then nothing
+        mock_select.side_effect = [
+            ([mock_process.stdout], [], []),  # First call: stdout ready
+            ([], [], []),  # Second call: nothing ready
+            ([], [], [])   # Third call: nothing ready (process finished)
+        ]
         
         result = claude_code("test prompt")
         
-        assert result.stdout == "Hello world"
+        assert result.stdout == "Hello world\n"
         assert result.stderr == ""
         assert result.structured is None
-        mock_run.assert_called_once_with(
-            ["claude", "test prompt"],
-            capture_output=True,
+        mock_popen.assert_called_once_with(
+            ["claude", "-p", "--verbose", "test prompt"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=120
+            cwd="/test/repo",
+            bufsize=1,
+            universal_newlines=True
         )
 
-    @unittest.mock.patch('daneel.subprocess.run')
-    def test_claude_code_structured(self, mock_run):
+    @unittest.mock.patch('daneel.find_git_root')
+    @unittest.mock.patch('daneel.subprocess.Popen')
+    @unittest.mock.patch('daneel.select.select')
+    @unittest.mock.patch('sys.stdout')
+    @unittest.mock.patch('sys.stderr')
+    def test_claude_code_structured(self, mock_stderr, mock_stdout, mock_select, mock_popen, mock_find_git_root):
         """Test claude_code with structured output."""
+        mock_find_git_root.return_value = "/test/repo"
         json_output = '{"result": "success", "data": [1, 2, 3]}'
-        mock_run.return_value = unittest.mock.Mock(
-            returncode=0,
-            stdout=json_output,
-            stderr=""
-        )
+        
+        # Mock the process
+        mock_process = unittest.mock.Mock()
+        mock_process.poll.side_effect = [None, 0]  # Running, then finished
+        mock_process.returncode = 0
+        mock_process.stdout.readline.side_effect = [json_output, ""]
+        mock_process.stderr.readline.side_effect = ["", ""]
+        mock_process.stdout.read.return_value = ""
+        mock_process.stderr.read.return_value = ""
+        mock_process.wait.return_value = None
+        mock_popen.return_value = mock_process
+        
+        # Mock select to return stdout ready once
+        mock_select.side_effect = [
+            ([mock_process.stdout], [], []),  # First call: stdout ready
+            ([], [], [])   # Second call: nothing ready (process finished)
+        ]
         
         result = claude_code("test prompt", structured=True)
         
         assert result.structured == {"result": "success", "data": [1, 2, 3]}
-        # Check that prompt was modified to request JSON
-        args = mock_run.call_args[0][0]
-        assert "Please respond with valid JSON only." in args[1]
+        # Check that --output-format json flag was used
+        args = mock_popen.call_args[0][0]
+        assert "--output-format" in args
+        assert "json" in args
 
-    @unittest.mock.patch('daneel.subprocess.run')
-    def test_claude_code_invalid_json(self, mock_run):
+    @unittest.mock.patch('daneel.find_git_root')
+    @unittest.mock.patch('daneel.subprocess.Popen')
+    @unittest.mock.patch('daneel.select.select')
+    @unittest.mock.patch('sys.stdout')
+    @unittest.mock.patch('sys.stderr')
+    def test_claude_code_invalid_json(self, mock_stderr, mock_stdout, mock_select, mock_popen, mock_find_git_root):
         """Test claude_code with invalid JSON output."""
-        mock_run.return_value = unittest.mock.Mock(
-            returncode=0,
-            stdout="invalid json {",
-            stderr=""
-        )
+        mock_find_git_root.return_value = "/test/repo"
+        # Mock the process
+        mock_process = unittest.mock.Mock()
+        mock_process.poll.side_effect = [None, 0]  # Running, then finished
+        mock_process.returncode = 0
+        mock_process.stdout.readline.side_effect = ["invalid json {", ""]
+        mock_process.stderr.readline.side_effect = ["", ""]
+        mock_process.stdout.read.return_value = ""
+        mock_process.stderr.read.return_value = ""
+        mock_process.wait.return_value = None
+        mock_popen.return_value = mock_process
+        
+        mock_select.side_effect = [
+            ([mock_process.stdout], [], []),
+            ([], [], [])
+        ]
         
         with pytest.raises(Exception, match="Failed to parse JSON output"):
             claude_code("test prompt", structured=True)
 
-    @unittest.mock.patch('daneel.subprocess.run')
-    def test_claude_code_retry_success(self, mock_run):
+    @unittest.mock.patch('daneel.find_git_root')
+    @unittest.mock.patch('daneel.subprocess.Popen')
+    @unittest.mock.patch('daneel.select.select')
+    @unittest.mock.patch('sys.stdout')
+    @unittest.mock.patch('sys.stderr')
+    @unittest.mock.patch('builtins.print')
+    def test_claude_code_retry_success(self, mock_print, mock_stderr_stream, mock_stdout_stream, mock_select, mock_popen, mock_find_git_root):
         """Test claude_code retry mechanism."""
-        # First call fails, second succeeds
-        mock_run.side_effect = [
-            unittest.mock.Mock(returncode=1, stdout="", stderr="error"),
-            unittest.mock.Mock(returncode=0, stdout="success", stderr="")
+        mock_find_git_root.return_value = "/test/repo"
+        # Mock first process (fails)
+        mock_process1 = unittest.mock.Mock()
+        mock_process1.poll.side_effect = [None, 0]
+        mock_process1.returncode = 1
+        mock_process1.stdout.readline.side_effect = ["", ""]
+        mock_process1.stderr.readline.side_effect = ["error", ""]
+        mock_process1.stdout.read.return_value = ""
+        mock_process1.stderr.read.return_value = ""
+        mock_process1.wait.return_value = None
+        
+        # Mock second process (succeeds)
+        mock_process2 = unittest.mock.Mock()
+        mock_process2.poll.side_effect = [None, 0]
+        mock_process2.returncode = 0
+        mock_process2.stdout.readline.side_effect = ["success\n", ""]
+        mock_process2.stderr.readline.side_effect = ["", ""]
+        mock_process2.stdout.read.return_value = ""
+        mock_process2.stderr.read.return_value = ""
+        mock_process2.wait.return_value = None
+        
+        mock_popen.side_effect = [mock_process1, mock_process2]
+        
+        # Mock select calls: first for process1 (fails), then for process2 (succeeds)
+        mock_select.side_effect = [
+            # First process (failure)
+            ([], [mock_process1.stderr], []),  # First call: stderr ready with error
+            ([], [], []),  # Second call: nothing ready (process finishes)
+            # Second process (success)  
+            ([mock_process2.stdout], [], []),  # Third call: stdout ready with success
+            ([], [], [])   # Fourth call: nothing ready (process finishes)
         ]
         
         with unittest.mock.patch('daneel.time.sleep'):
             result = claude_code("test prompt", retries=1)
         
-        assert result.stdout == "success"
-        assert mock_run.call_count == 2
+        assert result.stdout == "success\n"
+        assert mock_popen.call_count == 2
 
-    @unittest.mock.patch('daneel.subprocess.run')
-    def test_claude_code_timeout(self, mock_run):
+    @unittest.mock.patch('daneel.find_git_root')
+    @unittest.mock.patch('daneel.subprocess.Popen')
+    @unittest.mock.patch('daneel.select.select')
+    @unittest.mock.patch('sys.stdout')
+    @unittest.mock.patch('sys.stderr')
+    def test_claude_code_timeout(self, mock_stderr_stream, mock_stdout_stream, mock_select, mock_popen, mock_find_git_root):
         """Test claude_code timeout handling."""
-        mock_run.side_effect = subprocess.TimeoutExpired("claude", 120)
+        mock_find_git_root.return_value = "/test/repo"
         
-        with pytest.raises(Exception, match="Command timed out"):
+        # Mock the process
+        mock_process = unittest.mock.Mock()
+        # Use side_effect to simulate poll behavior: a few None returns, then finish
+        poll_count = [0]
+        def mock_poll():
+            poll_count[0] += 1
+            if poll_count[0] > 2:  # After a couple of iterations, break the loop
+                return 0
+            return None
+        mock_process.poll.side_effect = mock_poll
+        mock_process.returncode = 0
+        mock_process.stdout.readline.return_value = ""
+        mock_process.stderr.readline.return_value = ""
+        mock_process.stdout.read.return_value = ""
+        mock_process.stderr.read.return_value = ""
+        mock_process.wait.side_effect = subprocess.TimeoutExpired("claude", 120)
+        mock_process.kill.return_value = None
+        mock_popen.return_value = mock_process
+        
+        mock_select.return_value = ([], [], [])  # No data ready
+        
+        with pytest.raises(Exception, match="timed out after"):
             claude_code("test prompt", retries=0)
 
-    @unittest.mock.patch('daneel.subprocess.run')
-    def test_claude_code_not_found(self, mock_run):
+    @unittest.mock.patch('daneel.find_git_root')
+    @unittest.mock.patch('daneel.subprocess.Popen')
+    def test_claude_code_not_found(self, mock_popen, mock_find_git_root):
         """Test claude_code when claude command is not found."""
-        mock_run.side_effect = FileNotFoundError()
+        mock_find_git_root.return_value = "/test/repo"
+        mock_popen.side_effect = FileNotFoundError()
         
         with pytest.raises(Exception, match="Claude command not found"):
             claude_code("test prompt")
+
+    @unittest.mock.patch('daneel.subprocess.Popen')
+    @unittest.mock.patch('daneel.select.select')
+    @unittest.mock.patch('sys.stdout')
+    @unittest.mock.patch('sys.stderr')
+    def test_claude_code_with_custom_cwd(self, mock_stderr, mock_stdout, mock_select, mock_popen):
+        """Test claude_code with custom working directory."""
+        # Mock the process
+        mock_process = unittest.mock.Mock()
+        mock_process.poll.side_effect = [None, 0]  # Running, then finished
+        mock_process.returncode = 0
+        mock_process.stdout.readline.side_effect = ["Hello world", ""]
+        mock_process.stderr.readline.side_effect = ["", ""]
+        mock_process.stdout.read.return_value = ""
+        mock_process.stderr.read.return_value = ""
+        mock_process.wait.return_value = None
+        mock_popen.return_value = mock_process
+        
+        mock_select.side_effect = [
+            ([mock_process.stdout], [], []),
+            ([], [], [])
+        ]
+        
+        result = claude_code("test prompt", cwd="/custom/path")
+        
+        assert result.stdout == "Hello world"
+        mock_popen.assert_called_once_with(
+            ["claude", "-p", "--verbose", "test prompt"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd="/custom/path",
+            bufsize=1,
+            universal_newlines=True
+        )
 
 
 class TestValidate:
     """Tests for the validate function."""
 
+    @unittest.mock.patch('daneel.find_git_root')
     @unittest.mock.patch('daneel.subprocess.run')
-    def test_validate_success(self, mock_run):
+    def test_validate_success(self, mock_run, mock_find_git_root):
         """Test successful validate execution."""
+        mock_find_git_root.return_value = "/test/repo"
         mock_run.return_value = unittest.mock.Mock(
             returncode=0,
             stdout="success",
@@ -146,11 +297,20 @@ class TestValidate:
         result = validate("echo success", dummy_fail_fn)
         
         assert result.stdout == "success"
-        mock_run.assert_called_once()
+        mock_run.assert_called_once_with(
+            "echo success",
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd="/test/repo"
+        )
 
+    @unittest.mock.patch('daneel.find_git_root')
     @unittest.mock.patch('daneel.subprocess.run')
-    def test_validate_with_failure_function(self, mock_run):
+    def test_validate_with_failure_function(self, mock_run, mock_find_git_root):
         """Test validate with failure function."""
+        mock_find_git_root.return_value = "/test/repo"
         mock_run.side_effect = [
             unittest.mock.Mock(returncode=1, stdout="", stderr="error"),
             unittest.mock.Mock(returncode=0, stdout="fixed", stderr="")
@@ -185,6 +345,30 @@ class TestValidate:
         with unittest.mock.patch('daneel.time.sleep'):
             with pytest.raises(Exception, match="Command failed after"):
                 validate("failing command", dummy_fail_fn, retries=1)
+
+    @unittest.mock.patch('daneel.subprocess.run')
+    def test_validate_with_custom_cwd(self, mock_run):
+        """Test validate with custom working directory."""
+        mock_run.return_value = unittest.mock.Mock(
+            returncode=0,
+            stdout="success",
+            stderr=""
+        )
+        
+        def dummy_fail_fn(output):
+            return Output("fixed", "")
+        
+        result = validate("echo success", dummy_fail_fn, cwd="/custom/path")
+        
+        assert result.stdout == "success"
+        mock_run.assert_called_once_with(
+            "echo success",
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd="/custom/path"
+        )
 
 
 class TestUpdateYml:
@@ -401,3 +585,169 @@ Some content without checkboxes.
 
 # Fix import issue for subprocess.TimeoutExpired
 import subprocess
+
+
+class TestMain:
+    """Tests for the main function."""
+
+    @unittest.mock.patch('sys.argv', ['daneel.py'])
+    @unittest.mock.patch('builtins.print')
+    def test_main_no_arguments(self, mock_print):
+        """Test main function with no arguments."""
+        main()
+        
+        # Check that usage information is printed
+        calls = [call.args[0] for call in mock_print.call_args_list]
+        assert any("Daneel - Python helper functions" in call for call in calls)
+        assert any("Usage: python daneel.py <action>" in call for call in calls)
+        assert any("Available actions: fix_review, implement" in call for call in calls)
+
+    @unittest.mock.patch('sys.argv', ['daneel.py', 'nonexistent'])
+    @unittest.mock.patch('builtins.print')
+    def test_main_nonexistent_action(self, mock_print):
+        """Test main function with non-existent action."""
+        main()
+        
+        # Check that error message is printed
+        calls = [call.args[0] for call in mock_print.call_args_list]
+        assert any("Action 'nonexistent' not found" in call for call in calls)
+        assert any("fix_review" in call for call in calls)
+        assert any("implement" in call for call in calls)
+
+    @unittest.mock.patch('sys.argv', ['daneel.py', 'implement'])
+    @unittest.mock.patch('importlib.util.spec_from_file_location')
+    @unittest.mock.patch('importlib.util.module_from_spec')
+    def test_main_successful_action_execution(self, mock_module_from_spec, mock_spec_from_file):
+        """Test main function successfully executing an action."""
+        # Mock the module loading
+        mock_spec = unittest.mock.Mock()
+        mock_loader = unittest.mock.Mock()
+        mock_spec.loader = mock_loader
+        mock_spec_from_file.return_value = mock_spec
+        
+        # Mock the module with a main function
+        mock_module = unittest.mock.Mock()
+        mock_main_func = unittest.mock.Mock()
+        mock_module.main = mock_main_func
+        mock_module_from_spec.return_value = mock_module
+        
+        main()
+        
+        # Verify the action module was loaded and main was called
+        mock_spec_from_file.assert_called_once()
+        mock_loader.exec_module.assert_called_once_with(mock_module)
+        mock_main_func.assert_called_once()
+
+    @unittest.mock.patch('sys.argv', ['daneel.py', 'fix_review'])
+    @unittest.mock.patch('importlib.util.spec_from_file_location')
+    @unittest.mock.patch('builtins.print')
+    def test_main_spec_loading_failure(self, mock_print, mock_spec_from_file):
+        """Test main function when module spec loading fails."""
+        mock_spec_from_file.return_value = None
+        
+        main()
+        
+        calls = [call.args[0] for call in mock_print.call_args_list]
+        assert any("Could not load action module 'fix_review'" in call for call in calls)
+
+    @unittest.mock.patch('sys.argv', ['daneel.py', 'implement'])
+    @unittest.mock.patch('importlib.util.spec_from_file_location')
+    @unittest.mock.patch('importlib.util.module_from_spec')
+    @unittest.mock.patch('builtins.print')
+    def test_main_module_without_main_function(self, mock_print, mock_module_from_spec, mock_spec_from_file):
+        """Test main function when action module lacks main() function."""
+        # Mock the module loading
+        mock_spec = unittest.mock.Mock()
+        mock_loader = unittest.mock.Mock()
+        mock_spec.loader = mock_loader
+        mock_spec_from_file.return_value = mock_spec
+        
+        # Mock module without main function
+        mock_module = unittest.mock.Mock()
+        # Create a mock that will return False for hasattr(module, 'main')
+        def mock_hasattr(obj, name):
+            if name == 'main':
+                return False
+            return hasattr(type(obj), name)
+        
+        with unittest.mock.patch('builtins.hasattr', side_effect=mock_hasattr):
+            mock_module_from_spec.return_value = mock_module
+            
+            main()
+            
+            calls = [call.args[0] for call in mock_print.call_args_list]
+            assert any("does not have a main() function" in call for call in calls)
+
+    @unittest.mock.patch('sys.argv', ['daneel.py', 'implement'])
+    @unittest.mock.patch('importlib.util.spec_from_file_location')
+    @unittest.mock.patch('builtins.print')
+    def test_main_import_exception(self, mock_print, mock_spec_from_file):
+        """Test main function when module import raises exception."""
+        mock_spec_from_file.side_effect = ImportError("Cannot import module")
+        
+        main()
+        
+        calls = [call.args[0] for call in mock_print.call_args_list]
+        assert any("Error executing action 'implement'" in call for call in calls)
+        assert any("Cannot import module" in call for call in calls)
+
+    @unittest.mock.patch('sys.argv', ['daneel.py', 'implement'])
+    @unittest.mock.patch('importlib.util.spec_from_file_location')
+    @unittest.mock.patch('importlib.util.module_from_spec')
+    @unittest.mock.patch('builtins.print')
+    def test_main_execution_exception(self, mock_print, mock_module_from_spec, mock_spec_from_file):
+        """Test main function when action execution raises exception."""
+        # Mock the module loading
+        mock_spec = unittest.mock.Mock()
+        mock_loader = unittest.mock.Mock()
+        mock_spec.loader = mock_loader
+        mock_spec_from_file.return_value = mock_spec
+        
+        # Mock module with main function that raises exception
+        mock_module = unittest.mock.Mock()
+        mock_main_func = unittest.mock.Mock()
+        mock_main_func.side_effect = RuntimeError("Action execution failed")
+        mock_module.main = mock_main_func
+        mock_module_from_spec.return_value = mock_module
+        
+        main()
+        
+        calls = [call.args[0] for call in mock_print.call_args_list]
+        assert any("Error executing action 'implement'" in call for call in calls)
+        assert any("Action execution failed" in call for call in calls)
+
+    @unittest.mock.patch.object(Path, 'exists')
+    @unittest.mock.patch('sys.argv', ['daneel.py', 'test_action'])
+    @unittest.mock.patch('builtins.print')
+    def test_main_actions_directory_not_found(self, mock_print, mock_exists):
+        """Test main function when actions directory doesn't exist."""
+        mock_exists.return_value = False
+        
+        main()
+        
+        calls = [call.args[0] for call in mock_print.call_args_list]
+        assert any("Actions directory not found" in call for call in calls)
+
+    @unittest.mock.patch('sys.argv', ['daneel.py', 'implement'])
+    @unittest.mock.patch('importlib.util.spec_from_file_location')
+    @unittest.mock.patch('importlib.util.module_from_spec')
+    def test_main_with_real_action_paths(self, mock_module_from_spec, mock_spec_from_file):
+        """Test main function with real action file paths."""
+        # Mock the module loading
+        mock_spec = unittest.mock.Mock()
+        mock_loader = unittest.mock.Mock()
+        mock_spec.loader = mock_loader
+        mock_spec_from_file.return_value = mock_spec
+        
+        # Mock the module with a main function
+        mock_module = unittest.mock.Mock()
+        mock_main_func = unittest.mock.Mock()
+        mock_module.main = mock_main_func
+        mock_module_from_spec.return_value = mock_module
+        
+        main()
+        
+        # Verify that spec_from_file_location was called with correct parameters
+        call_args = mock_spec_from_file.call_args
+        assert call_args[0][0] == "actions.implement"  # module name
+        assert str(call_args[0][1]).endswith("actions/implement.py")  # file path

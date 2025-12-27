@@ -1,12 +1,15 @@
 """Daneel - Python helper functions for agentic coding assistants."""
 
+import importlib.util
 import json
 import re
+import select
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, List
 
 import yaml  # type: ignore[import-untyped]
 
@@ -38,7 +41,8 @@ def claude_code(
     prompt: str, 
     structured: bool = False, 
     timeout: int = 30 * 60, 
-    retries: int = 3
+    retries: int = 3,
+    cwd: Optional[str] = None
 ) -> Output:
     """Execute the 'claude' command with the given prompt.
     
@@ -47,6 +51,7 @@ def claude_code(
         structured: If True, request JSON output and parse it
         timeout: Maximum execution time in seconds
         retries: Number of retry attempts on failure
+        cwd: Working directory for command execution (uses find_git_root if None)
         
     Returns:
         Output object with command results
@@ -54,46 +59,104 @@ def claude_code(
     Raises:
         Exception: If all retries fail or command times out
     """
-    command = ["claude", "-p"]
+    command = ["claude", "-p", "--verbose"]
 
     if structured:
         command = command + ["--output-format", "json"]
     
+    working_dir = cwd or find_git_root()
+    
     for attempt in range(retries + 1):
         try:
-            result = subprocess.run(
-                command + [prompt], 
-                capture_output=True,
+            process = subprocess.Popen(
+                command + [prompt],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout
+                cwd=working_dir,
+                bufsize=1,
+                universal_newlines=True
             )
             
-            if result.returncode == 0:
+            stdout_lines = []
+            stderr_lines = []
+            
+            # Stream output in real-time
+            
+            while process.poll() is None:
+                # Use select to check for available data without blocking
+                ready, _, _ = select.select([process.stdout, process.stderr], [], [], 0.1)
+                
+                for stream in ready:
+                    if stream == process.stdout:
+                        line = stream.readline()
+                        if line:
+                            stdout_lines.append(line)
+                            sys.stdout.write(line)
+                            sys.stdout.flush()
+                    elif stream == process.stderr:
+                        line = stream.readline()
+                        if line:
+                            stderr_lines.append(line)
+                            sys.stderr.write(line)
+                            sys.stderr.flush()
+            
+            # Read any remaining output
+            remaining_stdout = process.stdout.read()
+            remaining_stderr = process.stderr.read()
+            
+            if remaining_stdout:
+                stdout_lines.append(remaining_stdout)
+                sys.stdout.write(remaining_stdout)
+                sys.stdout.flush()
+            
+            if remaining_stderr:
+                stderr_lines.append(remaining_stderr)
+                sys.stderr.write(remaining_stderr)
+                sys.stderr.flush()
+            
+            # Wait for process to complete
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+                raise Exception(f"Command timed out after {timeout} seconds")
+            
+            stdout_text = ''.join(stdout_lines)
+            stderr_text = ''.join(stderr_lines)
+            
+            if process.returncode == 0:
                 output = Output(
-                    stdout=result.stdout,
-                    stderr=result.stderr
+                    stdout=stdout_text,
+                    stderr=stderr_text
                 )
                 
                 if structured:
                     try:
-                        output.structured = json.loads(result.stdout.strip())
+                        output.structured = json.loads(stdout_text.strip())
                     except json.JSONDecodeError as e:
                         raise Exception(f"Failed to parse JSON output: {e}")
                 
                 return output
             
             if attempt < retries:
+                print(f"Attempt {attempt + 1} failed, retrying...")
                 # Exponential backoff
                 time.sleep(2 ** attempt)
                 continue
                 
-        except subprocess.TimeoutExpired:
-            if attempt < retries:
-                time.sleep(2 ** attempt)
-                continue
-            raise Exception(f"Command timed out after {timeout} seconds")
         except FileNotFoundError:
             raise Exception("Claude command not found")
+        except Exception as e:
+            if "timed out" in str(e):
+                if attempt < retries:
+                    print(f"Attempt {attempt + 1} timed out, retrying...")
+                    time.sleep(2 ** attempt)
+                    continue
+                raise e
+            else:
+                raise e
     
     raise Exception(f"Command failed after {retries + 1} attempts")
 
@@ -102,7 +165,8 @@ def validate(
     cmd: str,
     fail_fn: Callable[[Output], Output],
     timeout: int = 120,
-    retries: int = 3
+    retries: int = 3,
+    cwd: Optional[str] = None
 ) -> Output:
     """Execute a command and call fail_fn if it fails, then retry.
     
@@ -111,6 +175,7 @@ def validate(
         fail_fn: Function to call on failure, takes Output and returns Output
         timeout: Maximum execution time in seconds
         retries: Number of retry attempts on failure
+        cwd: Working directory for command execution (uses find_git_root if None)
         
     Returns:
         Output object with final command results
@@ -118,6 +183,8 @@ def validate(
     Raises:
         Exception: If all retries fail or command times out
     """
+    working_dir = cwd or find_git_root()
+    
     for attempt in range(retries + 1):
         try:
             result = subprocess.run(
@@ -125,7 +192,8 @@ def validate(
                 shell=True,
                 capture_output=True,
                 text=True,
-                timeout=timeout
+                timeout=timeout,
+                cwd=working_dir
             )
             
             output = Output(
@@ -255,11 +323,85 @@ def checkbox_progress(file: str) -> float:
     
     return completed / total
 
+def find_git_root() -> str:
+    """Find the root directory of the current git repository.
+    
+    Returns:
+        The absolute path to the root directory of the git repository.
+        
+    Raises:
+        Exception: If the current directory is not inside a git repository.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError:
+        raise Exception("Not inside a git repository")
+
+def changed_git_files() -> List[str]:
+    """Get a list of files changed in the current git repository.
+    
+    Returns:
+        A list of file paths that have been changed.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--name-only"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        files = result.stdout.strip().splitlines()
+        return [file for file in files if file]
+    except subprocess.CalledProcessError:
+        raise Exception("Failed to get changed git files") 
 
 def main() -> None:
     """Main entry point for the daneel command-line tool."""
-    print("Daneel - Python helper functions for agentic coding assistants")
-    print("This module provides helper functions and is not meant to be run directly.")
+    if len(sys.argv) < 2:
+        print("Daneel - Python helper functions for agentic coding assistants")
+        print("Usage: python daneel.py <action>")
+        print("Available actions: fix_review, implement")
+        return
+    
+    action = sys.argv[1]
+
+    # xxx If DANEEL_PATH is set, OR there is a daneel path in the current git repo, use that path instead. Otherwise use the actions_dir below.
+    actions_dir = Path(__file__).parent / "actions"
+    
+    if not actions_dir.exists():
+        print(f"Error: Actions directory not found: {actions_dir}")
+        return
+    
+    action_file = actions_dir / f"{action}.py"
+    
+    if not action_file.exists():
+        print(f"Error: Action '{action}' not found. Available actions:")
+        for py_file in actions_dir.glob("*.py"):
+            if py_file.name != "__init__.py":
+                print(f"  - {py_file.stem}")
+        return
+    
+    try:
+        spec = importlib.util.spec_from_file_location(f"actions.{action}", action_file)
+        if spec is None or spec.loader is None:
+            print(f"Error: Could not load action module '{action}'")
+            return
+        
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        
+        if hasattr(module, 'main'):
+            module.main()
+        else:
+            print(f"Error: Action module '{action}' does not have a main() function")
+    except Exception as e:
+        print(f"Error executing action '{action}': {e}")
 
 
 if __name__ == "__main__":

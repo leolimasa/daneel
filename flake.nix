@@ -62,6 +62,7 @@ EOF
           ];
           
           shellHook = ''
+            export ENV_NAME="$ENV_NAME daneel"
             echo "Daneel development environment"
             echo "Python version: ${python.version}"
             echo "Available commands: python, pytest, mypy, ruff, uv"
