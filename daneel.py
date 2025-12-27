@@ -16,16 +16,14 @@ import yaml  # type: ignore[import-untyped]
 
 @dataclass
 class Output:
-    """Dataclass representing the output of a command or agent execution.
+    """Dataclass representing the output of a command 
     
     Attributes:
         stdout: Standard output from command execution
         stderr: Standard error from command execution 
-        structured: Optional structured data parsed from JSON output
     """
     stdout: str
     stderr: str
-    structured: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         """Validate that stdout and stderr are strings."""
@@ -33,132 +31,6 @@ class Output:
             raise TypeError("stdout must be a string")
         if not isinstance(self.stderr, str):
             raise TypeError("stderr must be a string")
-        if self.structured is not None and not isinstance(self.structured, dict):
-            raise TypeError("structured must be a dictionary or None")
-
-
-def claude_code(
-    prompt: str, 
-    structured: bool = False, 
-    timeout: int = 30 * 60, 
-    retries: int = 3,
-    cwd: Optional[str] = None
-) -> Output:
-    """Execute the 'claude' command with the given prompt.
-    
-    Args:
-        prompt: The prompt to send to Claude
-        structured: If True, request JSON output and parse it
-        timeout: Maximum execution time in seconds
-        retries: Number of retry attempts on failure
-        cwd: Working directory for command execution (uses find_git_root if None)
-        
-    Returns:
-        Output object with command results
-        
-    Raises:
-        Exception: If all retries fail or command times out
-    """
-    command = ["claude", "-p", "--verbose"]
-
-    if structured:
-        command = command + ["--output-format", "json"]
-    
-    working_dir = cwd or find_git_root()
-    
-    for attempt in range(retries + 1):
-        try:
-            process = subprocess.Popen(
-                command + [prompt],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                cwd=working_dir,
-                bufsize=1,
-                universal_newlines=True
-            )
-            
-            stdout_lines = []
-            stderr_lines = []
-            
-            # Stream output in real-time
-            
-            while process.poll() is None:
-                # Use select to check for available data without blocking
-                ready, _, _ = select.select([process.stdout, process.stderr], [], [], 0.1)
-                
-                for stream in ready:
-                    if stream == process.stdout:
-                        line = stream.readline()
-                        if line:
-                            stdout_lines.append(line)
-                            sys.stdout.write(line)
-                            sys.stdout.flush()
-                    elif stream == process.stderr:
-                        line = stream.readline()
-                        if line:
-                            stderr_lines.append(line)
-                            sys.stderr.write(line)
-                            sys.stderr.flush()
-            
-            # Read any remaining output
-            remaining_stdout = process.stdout.read()
-            remaining_stderr = process.stderr.read()
-            
-            if remaining_stdout:
-                stdout_lines.append(remaining_stdout)
-                sys.stdout.write(remaining_stdout)
-                sys.stdout.flush()
-            
-            if remaining_stderr:
-                stderr_lines.append(remaining_stderr)
-                sys.stderr.write(remaining_stderr)
-                sys.stderr.flush()
-            
-            # Wait for process to complete
-            try:
-                process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-                raise Exception(f"Command timed out after {timeout} seconds")
-            
-            stdout_text = ''.join(stdout_lines)
-            stderr_text = ''.join(stderr_lines)
-            
-            if process.returncode == 0:
-                output = Output(
-                    stdout=stdout_text,
-                    stderr=stderr_text
-                )
-                
-                if structured:
-                    try:
-                        output.structured = json.loads(stdout_text.strip())
-                    except json.JSONDecodeError as e:
-                        raise Exception(f"Failed to parse JSON output: {e}")
-                
-                return output
-            
-            if attempt < retries:
-                print(f"Attempt {attempt + 1} failed, retrying...")
-                # Exponential backoff
-                time.sleep(2 ** attempt)
-                continue
-                
-        except FileNotFoundError:
-            raise Exception("Claude command not found")
-        except Exception as e:
-            if "timed out" in str(e):
-                if attempt < retries:
-                    print(f"Attempt {attempt + 1} timed out, retrying...")
-                    time.sleep(2 ** attempt)
-                    continue
-                raise e
-            else:
-                raise e
-    
-    raise Exception(f"Command failed after {retries + 1} attempts")
 
 
 def validate(
@@ -361,48 +233,5 @@ def changed_git_files() -> List[str]:
     except subprocess.CalledProcessError:
         raise Exception("Failed to get changed git files") 
 
-def main() -> None:
-    """Main entry point for the daneel command-line tool."""
-    if len(sys.argv) < 2:
-        print("Daneel - Python helper functions for agentic coding assistants")
-        print("Usage: python daneel.py <action>")
-        print("Available actions: fix_review, implement")
-        return
-    
-    action = sys.argv[1]
-
-    # xxx If DANEEL_PATH is set, OR there is a daneel path in the current git repo, use that path instead. Otherwise use the actions_dir below.
-    actions_dir = Path(__file__).parent / "actions"
-    
-    if not actions_dir.exists():
-        print(f"Error: Actions directory not found: {actions_dir}")
-        return
-    
-    action_file = actions_dir / f"{action}.py"
-    
-    if not action_file.exists():
-        print(f"Error: Action '{action}' not found. Available actions:")
-        for py_file in actions_dir.glob("*.py"):
-            if py_file.name != "__init__.py":
-                print(f"  - {py_file.stem}")
-        return
-    
-    try:
-        spec = importlib.util.spec_from_file_location(f"actions.{action}", action_file)
-        if spec is None or spec.loader is None:
-            print(f"Error: Could not load action module '{action}'")
-            return
-        
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        
-        if hasattr(module, 'main'):
-            module.main()
-        else:
-            print(f"Error: Action module '{action}' does not have a main() function")
-    except Exception as e:
-        print(f"Error executing action '{action}': {e}")
 
 
-if __name__ == "__main__":
-    main()
